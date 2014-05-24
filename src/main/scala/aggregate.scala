@@ -33,7 +33,7 @@ object aggregate {
   case class Address(number: String, street: String, city: String, zip: String)
   case class ShipTo(name: String, address: Address)
 
-  case class Order(orderNo: String, orderDate: Date, customer: Customer, 
+  case class Order(orderNo: String, orderDate: Date, customer: Customer,
     lineItems: Vector[LineItem], shipTo: ShipTo, netOrderValue: Option[BigDecimal] = None, status: OrderStatus = Placed)
 
   /**
@@ -51,20 +51,20 @@ object aggregate {
     s(order)
   }
 
-  private def validate = ReaderTStatus[Order, Boolean] {order =>
+  private def validate = ReaderTStatus[Order, Boolean] { order =>
     if (order.lineItems isEmpty) left(s"Validation failed for order $order") else right(true)
   }
 
-  private def approve = ReaderTStatus[Order, Boolean] {order =>
+  private def approve = ReaderTStatus[Order, Boolean] { order =>
     println("approved")
     right(true)
   }
 
-  private def checkCustomerStatus(customer: Customer) = ReaderTStatus[Order, Boolean] {order =>
+  private def checkCustomerStatus(customer: Customer) = ReaderTStatus[Order, Boolean] { order =>
     right(true)
   }
 
-  private def checkInventory = ReaderTStatus[Order, Boolean] {order =>
+  private def checkInventory = ReaderTStatus[Order, Boolean] { order =>
     println("inventory checked")
     right(true)
   }
@@ -72,104 +72,91 @@ object aggregate {
   /**
    * lens definitions for update of aggregate root
    */
-  val orderStatus = Lens.lensu[Order, OrderStatus] (
-    (o, value) => o.copy(status = value),
-    _.status
-  )
 
-  val orderLineItems = Lens.lensu[Order, Vector[LineItem]] (
-    (o, lis) => o.copy(lineItems = lis),
-    _.lineItems
-  )
-
-  val lineItemValue = Lens.lensu[LineItem, Option[BigDecimal]] (
-    (l, v) => l.copy(value = v),
-    _.value
-  )
-
-  val lineItemDiscount = Lens.lensu[LineItem, Option[BigDecimal]] (
-    (l, value) => l.copy(discount = value),
-    _.discount
-  )
-
-  def lineItemValues(i: Int) = ~lineItemValue compose vectorNthPLens(i)
-  def lineItemDiscounts(i: Int) = ~lineItemDiscount compose vectorNthPLens(i)
-
-  val orderShipTo = Lens.lensu[Order, ShipTo] (
+  val orderShipTo = Lens.lensu[Order, ShipTo](
     (o, sh) => o.copy(shipTo = sh),
-    _.shipTo
-  )
+    _.shipTo)
 
-  val shipToAddress = Lens.lensu[ShipTo, Address] (
+  val shipToAddress = Lens.lensu[ShipTo, Address](
     (sh, add) => sh.copy(address = add),
-    _.address
-  )
+    _.address)
 
-  val addressToCity = Lens.lensu[Address, String] (
+  val addressToCity = Lens.lensu[Address, String](
     (add, c) => add.copy(city = c),
-    _.city
-  )
+    _.city)
 
   def orderShipToCity = orderShipTo andThen shipToAddress andThen addressToCity
-  
-  def valueOrder = Kleisli[ProcessingStatus, Order, Order] {order =>
-    val o = orderLineItems.set(
-      order,
-      setLineItemValues(order.lineItems)
-    )
-    o.lineItems.map(_.value).sequenceU match {
-      case Some(_) => right(o)
-      case _ => left("Missing value for items")
-    }
+
+  def valueOrder = Kleisli[ProcessingStatus, Order, Order] { order =>
+    // No advantage of using lens
+    val o = order.copy(lineItems = setLineItemValues(order.lineItems))
+
+    // Extracted method
+    fieldNotEmptyInLineItems(o, _.value, "Missing value for items")
   }
 
-  private def setLineItemValues(lis: Vector[LineItem]) = {
-    (0 to lis.length - 1).foldLeft(lis) {(s, i) => 
-      val li = lis(i)
-      lineItemValues(i).set(s, unitPrice(li.item).map(_ * li.quantity)).getOrElse(s)
+  private def setLineItemValues(lis: Vector[LineItem]) =
+    // Disadvantage of using lens, code was more complicated
+    lis.map { li =>
+      li.copy(value = unitPrice(li.item).map(_ * li.quantity))
     }
+
+  def applyDiscounts = Kleisli[ProcessingStatus, Order, Order] { order =>
+    // No advantage of using lens
+    val o = order.copy(
+      lineItems = setLineItemDiscounts(order.lineItems, order.customer))
+
+    // Extracted method
+    fieldNotEmptyInLineItems(o, _.discount, "Missing discount for items")
   }
 
-  def applyDiscounts = Kleisli[ProcessingStatus, Order, Order] {order =>
-    val o = orderLineItems.set(
-      order,
-      setLineItemValues(order.lineItems)
-    )
-    o.lineItems.map(_.discount).sequenceU match {
-      case Some(_) => right(o)
-      case _ => left("Missing discount for items")
+  private def setLineItemDiscounts(lis: Vector[LineItem], customer: Customer) =
+    // Disadvantage of using lens, code was more complicated
+    lis.map { li =>
+      li.copy(discount = discount(li.item, customer))
     }
+
+  def checkOut = Kleisli[ProcessingStatus, Order, Order] { order =>
+
+    val netOrderValue = order.lineItems.foldLeft(BigDecimal(0).some) { (total, item) =>
+      // Created variable to ease reading
+      // Removed overcomplicated use of append in combination with tags
+      val actualValue = item.value |+| item.discount.map(_ * -1)
+      total |+| actualValue
+    }
+
+    // No advantage of using lens
+    right(order.copy(netOrderValue = netOrderValue))
   }
 
-  private def setLineItemDiscounts(lis: Vector[LineItem], customer: Customer) = {
-    (0 to lis.length - 1).foldLeft(lis) {(s, i) => 
-      val li = lis(i)
-      lineItemDiscounts(i).set(s, discount(li.item, customer)).getOrElse(s)
-    }
-  }
-
-  val orderNetValue = Lens.lensu[Order, Option[BigDecimal]] (
-    (o, v) => o.copy(netOrderValue = v),
-    _.netOrderValue
-  )
-
-  def checkOut = Kleisli[ProcessingStatus, Order, Order] {order =>
-
-    val netOrderValue = order.lineItems.foldLeft(BigDecimal(0).some) {(s, i) => 
-      s |+| (i.value |+| i.discount.map(d => Tags.Multiplication(BigDecimal(-1)) |+| Tags.Multiplication(d)))
-    }
-    right(orderNetValue.set(order, netOrderValue))
-  }
-
-  private def unitPrice(item: Item): Option[BigDecimal] = {
+  private def unitPrice(item: Item) =
     BigDecimal(12).some
-  }
 
-  private def discount(item: Item, customer: Customer) = {
+  private def discount(item: Item, customer: Customer) =
     BigDecimal(5).some
+
+  def process(order: Order): ProcessingStatus[Order] = {
+    (valueOrder andThen applyDiscounts andThen checkOut) =<<
+      // No advantage of using lens
+      right(order.copy(status = Validated))
   }
 
-  def process(order: Order) = {
-    (valueOrder andThen applyDiscounts andThen checkOut) =<< right(orderStatus.set(order, Validated))
-  }
+  private def fieldNotEmptyInLineItems(o: Order, field: LineItem => Option[_], message: => String): ProcessingStatus[Order] =
+    /*
+      // If extracted (using the field function) the original would
+      // be like this:
+
+      o.lineItems.map(field(_)).sequenceU match {
+        case Some(_) => right(o)
+        case _ => left(message)
+      }
+
+      I think the code below conveys the intention of the code more clearly:
+      "Create a message for the first empty field you find"
+     */
+    o.lineItems
+      .find(field(_).isEmpty)
+      .map(_ => message)
+      .toLeft(o)
+      .disjunction
 }
